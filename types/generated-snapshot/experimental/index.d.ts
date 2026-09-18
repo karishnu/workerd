@@ -532,7 +532,11 @@ type ExportedHandlerTailStreamHandler<Env = unknown, Props = unknown> = (
   event: TailStream.TailEvent<TailStream.Onset>,
   env: Env,
   ctx: ExecutionContext<Props>,
-) => TailStream.TailEventHandlerType | Promise<TailStream.TailEventHandlerType>;
+) =>
+  | TailStream.TailEventHandlerType
+  | Promise<TailStream.TailEventHandlerType>
+  | undefined
+  | Promise<undefined>;
 type ExportedHandlerScheduledHandler<Env = unknown, Props = unknown> = (
   controller: ScheduledController,
   env: Env,
@@ -16196,7 +16200,9 @@ declare namespace CloudflareWorkersModule {
       event: TailStream.TailEvent<TailStream.Onset>,
     ):
       | TailStream.TailEventHandlerType
-      | Promise<TailStream.TailEventHandlerType>;
+      | Promise<TailStream.TailEventHandlerType>
+      | undefined
+      | Promise<undefined>;
     test?(controller: TestController): void | Promise<void>;
     trace?(traces: TraceItem[]): void | Promise<void>;
   }
