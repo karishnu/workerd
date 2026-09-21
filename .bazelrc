@@ -124,32 +124,21 @@ build:v8-codegen-opt-windows --per_file_copt=external/perfetto@/O2,/clang:-O3
 build:unix --config=v8-codegen-opt
 build:windows  --config=v8-codegen-opt-windows
 
-# In Google projects, exceptions are not used as a rule. Disabling them is more consistent with the
-# canonical V8 build and improves code size. Paths are adjusted for bzlmod mangling – V8 and ICU use
-# a wildcard for this as the prefix is some variation of +_repo_rules3+ where the number can change
-# when refactoring MODULE.bazel – setting this directly would be too brittle
+# workerd is built with exceptions, and so is every C++ library linked into it that shares
+# standard-library templates with it (V8, ICU, perfetto, boringssl, ...), even though none of
+# them throws. Those templates are instantiated in each translation unit that uses them, and the
+# linker keeps one copy per binary, whichever it sees first. A copy from a translation unit built
+# without exceptions turns the throw into an abort, so a regex_error or bad_optional_access
+# raised in workerd would abort instead of being caught, depending on link order.
+#
+# abseil, protobuf and tcmalloc are built without exceptions, as Google builds them and as
+# edgeworker does. They share few such templates with workerd, and none that workerd catches.
 build:unix --per_file_copt=external/abseil-cpp@-fno-exceptions
 build:unix --per_file_copt=external/protobuf@-fno-exceptions
 build:unix --per_file_copt=external/tcmalloc@-fno-exceptions
-build:unix --per_file_copt=external/.*com_googlesource_chromium_icu@-fno-exceptions
-build:unix --per_file_copt=external/perfetto@-fno-exceptions
-build:unix --per_file_copt=external/boringssl@-fno-exceptions
-build:unix --per_file_copt=external/.*v8@-fno-exceptions
-build:unix --per_file_copt=external/ada-url@-fno-exceptions
-build:unix --per_file_copt=external/+http+simdutf@-fno-exceptions
 build:windows --per_file_copt=external/abseil-cpp@/clang:-fno-exceptions
 build:windows --per_file_copt=external/protobuf@/clang:-fno-exceptions
 build:windows --per_file_copt=external/tcmalloc@/clang:-fno-exceptions
-build:windows --per_file_copt=external/.*com_googlesource_chromium_icu@/clang:-fno-exceptions
-build:windows --per_file_copt=external/perfetto@/clang:-fno-exceptions
-build:windows --per_file_copt=external/boringssl@/clang:-fno-exceptions
-build:windows --per_file_copt=external/.*v8@/clang:-fno-exceptions
-build:windows --per_file_copt=external/ada-url@/clang:-fno-exceptions
-build:windows --per_file_copt=external/+http+simdutf@/clang:-fno-exceptions
-
-# V8 torque is an exception from this policy, see v8 BUILD.gn.
-build:unix --per_file_copt=external/.*v8/src/torque@-fexceptions
-build:windows --per_file_copt=external/.*v8/src/torque@/clang:-fexceptions
 
 # Limit transitive header includes within libc++. This improves compliance with IWYU, helps avoid
 # errors with downstream projects that implicitly define this already and reduces total include size.
