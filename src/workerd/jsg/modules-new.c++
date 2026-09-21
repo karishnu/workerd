@@ -2111,6 +2111,23 @@ ModuleBundle::BundleBuilder& ModuleBundle::BundleBuilder::addWasmModule(kj::Stri
   return *this;
 }
 
+ModuleBundle::BundleBuilder& ModuleBundle::BundleBuilder::addOwnedWasmModule(kj::StringPtr name,
+    kj::Arc<kj::Array<const kj::byte>> data,
+    kj::Maybe<v8::CompiledWasmModule> maybeCompiled) {
+  const auto url = processModuleName(name, bundleBase);
+  auto callback =
+      jsg::modules::Module::newOwnedWasmModuleHandler(kj::mv(data), kj::mv(maybeCompiled));
+  add(url,
+      [url = url.clone(), callback = kj::mv(callback), type = type()](
+          const ResolveContext& context) mutable
+      -> kj::Maybe<kj::OneOf<kj::String, kj::Own<Module>>> {
+    kj::Own<Module> mod = Module::newSynthetic(kj::mv(url), type, kj::mv(callback), nullptr,
+        EsModule::Flags::WASM, Module::ContentType::WASM);
+    return kj::Maybe<kj::OneOf<kj::String, kj::Own<Module>>>(kj::mv(mod));
+  });
+  return *this;
+}
+
 ModuleBundle::BundleBuilder& ModuleBundle::BundleBuilder::alias(
     kj::StringPtr alias, kj::StringPtr name) {
   const auto id = processModuleName(name, bundleBase);
@@ -2532,6 +2549,14 @@ Module::EvaluateCallback Module::newTextModuleHandler(kj::ArrayPtr<const char> d
   };
 }
 
+Module::EvaluateCallback Module::newOwnedTextModuleHandler(kj::Arc<kj::String> data) {
+  auto callback = newTextModuleHandler(data->asArray());
+  return [data = kj::mv(data), callback = kj::mv(callback)](Lock& js, const Url& id,
+             const ModuleNamespace& ns, const CompilationObserver& observer) mutable {
+    return callback(js, id, ns, observer);
+  };
+}
+
 Module::EvaluateCallback Module::newDataModuleHandler(kj::ArrayPtr<const kj::byte> data) {
   return [data](Lock& js, const Url& id, const ModuleNamespace& ns,
              const CompilationObserver&) -> bool {
@@ -2545,6 +2570,15 @@ Module::EvaluateCallback Module::newDataModuleHandler(kj::ArrayPtr<const kj::byt
   };
 }
 
+Module::EvaluateCallback Module::newOwnedDataModuleHandler(
+    kj::Arc<kj::Array<const kj::byte>> data) {
+  auto callback = newDataModuleHandler(data->asPtr());
+  return [data = kj::mv(data), callback = kj::mv(callback)](Lock& js, const Url& id,
+             const ModuleNamespace& ns, const CompilationObserver& observer) mutable {
+    return callback(js, id, ns, observer);
+  };
+}
+
 Module::EvaluateCallback Module::newJsonModuleHandler(kj::ArrayPtr<const char> data) {
   return [data](Lock& js, const Url& id, const ModuleNamespace& ns,
              const CompilationObserver& observer) -> bool {
@@ -2555,6 +2589,14 @@ Module::EvaluateCallback Module::newJsonModuleHandler(kj::ArrayPtr<const char> d
       js.v8Isolate->ThrowException(exception.getHandle(js));
       return false;
     });
+  };
+}
+
+Module::EvaluateCallback Module::newOwnedJsonModuleHandler(kj::Arc<kj::String> data) {
+  auto callback = newJsonModuleHandler(data->asArray());
+  return [data = kj::mv(data), callback = kj::mv(callback)](Lock& js, const Url& id,
+             const ModuleNamespace& ns, const CompilationObserver& observer) mutable {
+    return callback(js, id, ns, observer);
   };
 }
 
@@ -2603,6 +2645,15 @@ Module::EvaluateCallback Module::newWasmModuleHandler(
       js.v8Isolate->ThrowException(exception.getHandle(js));
       return false;
     });
+  };
+}
+
+Module::EvaluateCallback Module::newOwnedWasmModuleHandler(
+    kj::Arc<kj::Array<const kj::byte>> data, kj::Maybe<v8::CompiledWasmModule> maybeCompiled) {
+  auto callback = newWasmModuleHandler(data->asPtr(), kj::mv(maybeCompiled));
+  return [data = kj::mv(data), callback = kj::mv(callback)](Lock& js, const Url& id,
+             const ModuleNamespace& ns, const CompilationObserver& observer) mutable {
+    return callback(js, id, ns, observer);
   };
 }
 

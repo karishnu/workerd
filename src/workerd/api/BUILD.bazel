@@ -155,6 +155,7 @@ wd_cc_library(
     visibility = ["//visibility:public"],
     deps = [
         "//src/workerd/io",
+        "//src/workerd/util:capnp-util",
     ],
 )
 

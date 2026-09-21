@@ -37,7 +37,8 @@
       "owner": "capnproto",
       "repo": "capnproto",
       "branch": "v2",
-      "extra_strip_prefix": "/c++"
+      "extra_strip_prefix": "/c++",
+      "freeze_commit": "5b1c888f18e451bbdc45e91a88b0a9f2f94846e9"
     },
     // We want to avoid version skew with v8, so we use identical versions. Keep this
     // V8-aligned dependency marked as such in ci/v8_update.py.

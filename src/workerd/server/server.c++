@@ -35,6 +35,7 @@
 #include <workerd/server/actor-id-impl.h>
 #include <workerd/server/facet-tree-index.h>
 #include <workerd/server/fallback-service.h>
+#include <workerd/util/capnp-util.h>
 #include <workerd/util/exception.h>
 #include <workerd/util/http-util.h>
 #include <workerd/util/mimetype.h>
@@ -5110,7 +5111,7 @@ void Server::deleteAllActors(kj::Maybe<const kj::Exception&> reason) {
 // representation so that we can potentially build it dynamically from input that isn't a
 // workerd config file.
 struct Server::WorkerDef {
-  CompatibilityFlags::Reader featureFlags;
+  kj::Arc<CompatibilityFlags::Reader> featureFlags;
   WorkerSource source;
   kj::Maybe<kj::StringPtr> moduleFallback;
   const kj::HashMap<kj::String, ActorConfig>& localActorConfigs;
@@ -5138,10 +5139,6 @@ struct Server::WorkerDef {
   // constructed in a vastly different way for dynamically-loaded workers.
   kj::Function<void(jsg::Lock& lock, const Worker::Api& api, v8::Local<v8::Object> target)>
       compileBindings;
-
-  // If the WorkerDef was created from a DymamicWorkerSource and that
-  // source contains a clone of the source bundle, this will take ownership.
-  kj::Maybe<kj::Own<void>> maybeOwnedSourceCode;
 
   // Callback invoked when abortIsolate() is called. Used by dynamic workers to remove
   // themselves from the loader's isolate map.
@@ -5370,7 +5367,7 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
       });
 
       WorkerDef def{
-        .featureFlags = source.compatibilityFlags,
+        .featureFlags = kj::mv(source.compatibilityFlags),
         .source = kj::mv(source.source),
         .moduleFallback = kj::none,
         .localActorConfigs = EMPTY_ACTOR_CONFIGS,
@@ -5405,12 +5402,6 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
           env.populateJsObject(js, jsg::JsObject(target));
         },
 
-        // Note here that we always keep the ownContent from the source, even if
-        // ownContentIsRpcResponse is true. This is safe in workerd because we
-        // are single-threaded here and we don't need to worry about the cross-thread
-        // ownership issues. For the downstream use, however, we need to be careful
-        // to not copy the ownContent if it is an RPC response.
-        .maybeOwnedSourceCode = kj::mv(source.ownContent),
         // The callback is owned by the WorkerService, which is owned by `this`, so a raw
         // pointer is safe.
         .abortIsolateCallback = kj::Function<void()>([this]() { onAbortIsolate(); }),
@@ -5598,37 +5589,39 @@ static MainModuleIsPython isPythonMainModule(config::Worker::Reader conf) {
 }
 
 kj::Promise<kj::Own<Server::Service>> Server::makeWorker(kj::StringPtr name,
-    config::Worker::Reader conf,
+    kj::Arc<config::Worker::Reader> ownedConf,
     capnp::List<config::Extension>::Reader extensions) {
   TRACE_EVENT("workerd", "Server::makeWorker()", "name", name.cStr());
+  auto conf = *ownedConf;
   auto& localActorConfigs = KJ_ASSERT_NONNULL(actorConfigs.find(name));
 
   ConfigErrorReporter errorReporter(*this, name);
 
-  capnp::MallocMessageBuilder arena;
   // TODO(beta): Factor out FeatureFlags from WorkerBundle.
-  auto featureFlags = arena.initRoot<CompatibilityFlags>();
-
-  KJ_IF_SOME(overrideDate, testCompatibilityDateOverride) {
-    // When testCompatibilityDateOverride is set, the config must NOT specify compatibilityDate.
-    if (conf.hasCompatibilityDate()) {
-      errorReporter.addError(kj::str(
-          "Worker specifies compatibilityDate but --compat-date was provided. "
-          "When using --compat-date, workers must not specify compatibilityDate in the config. "
-          "Use compatibilityFlags to enable/disable specific flags if needed."));
+  auto ownedFeatureFlags =
+      buildArcMessage<CompatibilityFlags>([&](CompatibilityFlags::Builder featureFlags) {
+    KJ_IF_SOME(overrideDate, testCompatibilityDateOverride) {
+      // When testCompatibilityDateOverride is set, the config must NOT specify compatibilityDate.
+      if (conf.hasCompatibilityDate()) {
+        errorReporter.addError(kj::str(
+            "Worker specifies compatibilityDate but --compat-date was provided. "
+            "When using --compat-date, workers must not specify compatibilityDate in the config. "
+            "Use compatibilityFlags to enable/disable specific flags if needed."));
+      }
+      // Use FUTURE_FOR_TEST to allow any valid date (including far future like 2999-12-31)
+      // without validation against CODE_VERSION or current date.
+      compileCompatibilityFlags(overrideDate, conf.getCompatibilityFlags(), featureFlags,
+          errorReporter, experimental, CompatibilityDateValidation::FUTURE_FOR_TEST, nullptr,
+          isPythonMainModule(conf));
+    } else if (conf.hasCompatibilityDate()) {
+      compileCompatibilityFlags(conf.getCompatibilityDate(), conf.getCompatibilityFlags(),
+          featureFlags, errorReporter, experimental, CompatibilityDateValidation::CODE_VERSION,
+          nullptr, isPythonMainModule(conf));
+    } else {
+      errorReporter.addError(kj::str("Worker must specify compatibilityDate."));
     }
-    // Use FUTURE_FOR_TEST to allow any valid date (including far future like 2999-12-31)
-    // without validation against CODE_VERSION or current date.
-    compileCompatibilityFlags(overrideDate, conf.getCompatibilityFlags(), featureFlags,
-        errorReporter, experimental, CompatibilityDateValidation::FUTURE_FOR_TEST, nullptr,
-        isPythonMainModule(conf));
-  } else if (conf.hasCompatibilityDate()) {
-    compileCompatibilityFlags(conf.getCompatibilityDate(), conf.getCompatibilityFlags(),
-        featureFlags, errorReporter, experimental, CompatibilityDateValidation::CODE_VERSION,
-        nullptr, isPythonMainModule(conf));
-  } else {
-    errorReporter.addError(kj::str("Worker must specify compatibilityDate."));
-  }
+  });
+  auto featureFlagsReader = *ownedFeatureFlags;
 
   kj::Vector<FutureSubrequestChannel> subrequestChannels;
   kj::Vector<FutureActorChannel> actorChannels;
@@ -5649,8 +5642,8 @@ kj::Promise<kj::Own<Server::Service>> Server::makeWorker(kj::StringPtr name,
 
   // Construct `WorkerDef` from `conf`.
   WorkerDef def{
-    .featureFlags = featureFlags.asReader(),
-    .source = WorkerdApi::extractSource(name, conf, featureFlags.asReader(), errorReporter),
+    .featureFlags = kj::mv(ownedFeatureFlags),
+    .source = WorkerdApi::extractSource(name, kj::mv(ownedConf), featureFlagsReader, errorReporter),
     .moduleFallback = conf.hasModuleFallback() ? kj::some(conf.getModuleFallback()) : kj::none,
     .localActorConfigs = localActorConfigs,
     .isDynamic = false,
@@ -5738,7 +5731,7 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
   // Note: Python workers do not support the new module registry;
   // isNewModuleRegistryEnabled() returns false for them regardless of the
   // new_module_registry flag, so they always take the legacy path below.
-  bool usingNewModuleRegistry = isNewModuleRegistryEnabled(def.featureFlags);
+  bool usingNewModuleRegistry = isNewModuleRegistryEnabled(*def.featureFlags);
   kj::Maybe<kj::Arc<jsg::modules::ModuleRegistry>> newModuleRegistry;
   if (usingNewModuleRegistry) {
     KJ_REQUIRE(experimental,
@@ -5763,7 +5756,7 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
 
     KJ_IF_SOME(exception, kj::runCatchingExceptions([&]() {
       newModuleRegistry = WorkerdApi::newWorkerdModuleRegistry(
-          def.source.variant.tryGet<Worker::Script::ModulesSource>(), def.featureFlags,
+          def.source.variant.tryGet<Worker::Script::ModulesSource>(), def.featureFlags.addRef(),
           pythonConfig, bundleBase, extensions, kj::mv(maybeFallbackService),
           ArtifactBundler::makeDisabledBundler());
     })) {
@@ -5778,8 +5771,11 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
       // for source-level config errors. The worker never runs: config errors
       // prevent the server from serving.
       errorReporter.addError(kj::str(exception.getDescription()));
-      def.source = WorkerSource(Worker::Script::ScriptSource{""_kj, name, nullptr});
-      newModuleRegistry = WorkerdApi::newWorkerdModuleRegistry(kj::none, def.featureFlags,
+      def.source = WorkerSource(Worker::Script::ScriptSource{
+        .mainScript = kj::arc<kj::String>(kj::str(""_kj)),
+        .mainScriptName = kj::arc<kj::String>(kj::str(name)),
+      });
+      newModuleRegistry = WorkerdApi::newWorkerdModuleRegistry(kj::none, def.featureFlags.addRef(),
           pythonConfig, bundleBase, capnp::List<config::Extension>::Reader{}, kj::none,
           ArtifactBundler::makeDisabledBundler());
     }
@@ -5796,7 +5792,7 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
       };
     };
   }
-  auto api = kj::heap<WorkerdApi>(globalContext->v8System, def.featureFlags, extensions,
+  auto api = kj::heap<WorkerdApi>(globalContext->v8System, def.featureFlags.addRef(), extensions,
       limitEnforcer->getCreateParams(), isolateGroup, kj::mv(jsgobserver), *memoryCacheProvider,
       pythonConfig, kj::mv(listeners));
 
@@ -5850,12 +5846,14 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
               // The value is the specifier of the new target module.
               return kj::Maybe(kj::mv(redirect));
             }
-            KJ_CASE_ONEOF(module, kj::Own<config::Worker::Module::Reader>) {
+            KJ_CASE_ONEOF(module, kj::Arc<config::Worker::Module::Reader>) {
+              auto moduleReader = kj::Arc<config::Worker::Module::Reader>(kj::mv(module));
               KJ_IF_SOME(module,
-                  WorkerdApi::tryCompileModule(js, *module, observer, featureFlags)) {
+                  WorkerdApi::tryCompileModule(js, moduleReader.addRef(), observer, featureFlags)) {
                 return kj::Maybe(kj::mv(module));
               }
-              KJ_LOG(ERROR, "Fallback service does not support this module type", module->which());
+              KJ_LOG(ERROR, "Fallback service does not support this module type",
+                  moduleReader->which());
             }
           }
         }
@@ -5869,8 +5867,8 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
   auto artifactBundler = ArtifactBundler::makeDisabledBundler();
 
   auto script = isolate->newScript(name, def.source, IsolateObserver::StartType::COLD,
-      SpanParent(nullptr), workerFs.attach(kj::mv(def.maybeOwnedSourceCode)), false, errorReporter,
-      kj::mv(artifactBundler), kj::mv(newModuleRegistry));
+      SpanParent(nullptr), kj::mv(workerFs), false, errorReporter, kj::mv(artifactBundler),
+      kj::mv(newModuleRegistry));
 
   using Global = WorkerdApi::Global;
   jsg::V8Ref<v8::Object> ctxExportsHandle = nullptr;
@@ -6161,9 +6159,11 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
 
 // =======================================================================================
 
-kj::Promise<kj::Own<Server::Service>> Server::makeService(config::Service::Reader conf,
+kj::Promise<kj::Own<Server::Service>> Server::makeService(
+    kj::Arc<config::Service::Reader> ownedConf,
     kj::HttpHeaderTable::Builder& headerTableBuilder,
     capnp::List<config::Extension>::Reader extensions) {
+  auto conf = *ownedConf;
   kj::StringPtr name = conf.getName();
 
   switch (conf.which()) {
@@ -6178,7 +6178,10 @@ kj::Promise<kj::Own<Server::Service>> Server::makeService(config::Service::Reade
       co_return makeNetworkService(conf.getNetwork());
 
     case config::Service::WORKER:
-      co_return co_await makeWorker(name, conf.getWorker(), extensions);
+      co_return co_await makeWorker(name,
+          kj::mv(ownedConf).project(
+              [](config::Service::Reader service) { return service.getWorker(); }),
+          extensions);
 
     case config::Service::DISK:
       co_return makeDiskDirectoryService(name, conf.getDisk(), headerTableBuilder);
@@ -7141,9 +7144,11 @@ kj::Promise<void> Server::handleDrain(kj::Promise<void> drainWhen) {
   }
 }
 
-kj::Promise<void> Server::run(
-    jsg::V8System& v8System, config::Config::Reader config, kj::Promise<void> drainWhen) {
+kj::Promise<void> Server::run(jsg::V8System& v8System,
+    kj::Arc<config::Config::Reader> ownedConfig,
+    kj::Promise<void> drainWhen) {
   TRACE_EVENT("workerd", "Server.run");
+  auto config = *ownedConfig;
 
   // Update logging settings from config (overridding structuredLogging when so)
   if (config.hasLogging()) {
@@ -7170,7 +7175,7 @@ kj::Promise<void> Server::run(
   auto forkedDrainWhen = handleDrain(kj::mv(drainWhen)).fork();
 
   co_await bindSockets(config);
-  co_await startServices(v8System, config, headerTableBuilder, forkedDrainWhen);
+  co_await startServices(v8System, ownedConfig.addRef(), headerTableBuilder, forkedDrainWhen);
 
   auto listenPromise = listenOnSockets(config, headerTableBuilder, forkedDrainWhen);
 
@@ -7258,8 +7263,8 @@ uint startInspector(
 
 kj::Promise<void> Server::preloadPython(
     kj::StringPtr workerName, const WorkerDef& workerDef, ErrorReporter& errorReporter) {
-  if (workerDef.featureFlags.getPythonWorkers()) {
-    auto pythonRelease = getPythonSnapshotRelease(workerDef.featureFlags);
+  if (workerDef.featureFlags->getPythonWorkers()) {
+    auto pythonRelease = getPythonSnapshotRelease(*workerDef.featureFlags);
     KJ_IF_SOME(release, pythonRelease) {
       auto version = getPythonBundleName(release);
 
@@ -7271,9 +7276,10 @@ kj::Promise<void> Server::preloadPython(
 }
 
 kj::Promise<void> Server::startServices(jsg::V8System& v8System,
-    config::Config::Reader config,
+    kj::Arc<config::Config::Reader> ownedConfig,
     kj::HttpHeaderTable::Builder& headerTableBuilder,
     kj::ForkedPromise<void>& forkedDrainWhen) {
+  auto config = *ownedConfig;
   // ---------------------------------------------------------------------------
   // Configure services
   TRACE_EVENT("workerd", "startServices");
@@ -7358,9 +7364,13 @@ kj::Promise<void> Server::startServices(jsg::V8System& v8System,
   }
 
   // Second pass: Build services.
-  for (auto serviceConf: config.getServices()) {
-    kj::StringPtr name = serviceConf.getName();
-    auto service = co_await makeService(serviceConf, headerTableBuilder, config.getExtensions());
+  auto serviceConfs = config.getServices();
+  for (auto i: kj::zeroTo(serviceConfs.size())) {
+    auto serviceConf = ownedConfig.addRef().project(
+        [i](config::Config::Reader root) { return root.getServices()[i]; });
+    auto name = kj::str(serviceConf->getName());
+    auto service =
+        co_await makeService(kj::mv(serviceConf), headerTableBuilder, config.getExtensions());
 
     services.upsert(kj::str(name), kj::mv(service), [&](auto&&...) {
       reportConfigError(kj::str("Config defines multiple services named \"", name, "\"."));
@@ -7702,9 +7712,10 @@ kj::Promise<void> Server::listenOnSockets(config::Config::Reader config,
 // Server::test()
 
 kj::Promise<bool> Server::test(jsg::V8System& v8System,
-    config::Config::Reader config,
+    kj::Arc<config::Config::Reader> ownedConfig,
     kj::StringPtr servicePattern,
     kj::StringPtr entrypointPattern) {
+  auto config = *ownedConfig;
 
   if (config.hasLogging()) {
     auto logging = config.getLogging();
@@ -7729,7 +7740,7 @@ kj::Promise<bool> Server::test(jsg::V8System& v8System,
   auto forkedDrainWhen = kj::Promise<void>(kj::NEVER_DONE).fork();
 
   co_await bindSockets(config);
-  co_await startServices(v8System, config, headerTableBuilder, forkedDrainWhen);
+  co_await startServices(v8System, ownedConfig.addRef(), headerTableBuilder, forkedDrainWhen);
 
   // Tests usually do not configure sockets, but they can, especially loopback sockets. Arrange
   // to wait on them. Crash if listening fails.

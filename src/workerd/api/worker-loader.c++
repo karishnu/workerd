@@ -5,6 +5,7 @@
 #include <workerd/io/compatibility-date.h>
 #include <workerd/io/features.h>
 #include <workerd/io/io-context.h>
+#include <workerd/util/capnp-util.h>
 
 #include <capnp/message.h>
 #include <kj/vector.h>
@@ -104,21 +105,8 @@ jsg::Ref<WorkerStub> WorkerLoader::load(jsg::Lock& js, WorkerCode code) {
 
   auto source = toDynamicWorkerSource(js, ioctx, compatDateValidation, kj::mv(code));
 
-  // Annoyingly, the callback we pass to `loadIsolate()` technically may be called any number of
-  // times. Yes, even though we aren't providing an ID. The runtime can actually evict the isolate
-  // while a stub still exists, as long as there is no active request on the stub, and then
-  // recreate the isolate on the next request. Moreover, it may ultimately destroy the `ownContent`
-  // in another thread, so we need to use atomic refcounting on it. Ugh!
-  struct OwnContentWrapper: public kj::AtomicRefcounted {
-    kj::Own<void> content;
-    OwnContentWrapper(kj::Own<void> content): content(kj::mv(content)) {}
-  };
-  auto ownContentWrapper = kj::atomicRefcounted<OwnContentWrapper>(kj::mv(source.ownContent));
-
-  auto isolateChannel = ioctx.getIoChannelFactory().loadIsolate(channel, kj::none,
-      [source = kj::mv(source), ownContentWrapper = kj::mv(ownContentWrapper)]() mutable {
-    return source.clone(kj::atomicAddRef(*ownContentWrapper));
-  });
+  auto isolateChannel = ioctx.getIoChannelFactory().loadIsolate(
+      channel, kj::none, [source = kj::mv(source)]() mutable { return source.clone(); });
 
   return js.alloc<WorkerStub>(ioctx.addObject(kj::mv(isolateChannel)));
 }
@@ -170,8 +158,7 @@ DynamicWorkerSource WorkerLoader::toDynamicWorkerSource(jsg::Lock& js,
     }
   }
 
-  auto ownCompatFlags = extractCompatFlags(js, code, compatDateValidation);
-  CompatibilityFlags::Reader compatFlags = *ownCompatFlags;
+  auto compatFlags = extractCompatFlags(js, code, compatDateValidation);
 
   Frankenvalue env;
   KJ_IF_SOME(codeEnv, code.env) {
@@ -224,25 +211,23 @@ DynamicWorkerSource WorkerLoader::toDynamicWorkerSource(jsg::Lock& js,
   }
 
   return {.source = kj::mv(extractedSource),
-    .compatibilityFlags = compatFlags,
+    .compatibilityFlags = kj::mv(compatFlags),
     .limits = code.limits,
     .env = kj::mv(env),
     .globalOutbound = kj::mv(globalOutbound),
     .tails = kj::mv(tailChannels),
-    .streamingTails = kj::mv(streamingTailChannels),
-    .ownContent = ownCompatFlags.attach(kj::mv(code.modules), kj::mv(code.mainModule)),
-    .ownContentIsRpcResponse = false};
+    .streamingTails = kj::mv(streamingTailChannels)};
 }
 
 // Builds WASM module content from an already-compiled `WebAssembly.Module`, sharing the compiled
-// code with the loaded worker rather than recompiling. `body` points at the module's wire bytes,
-// which are owned by the compiled module itself.
+// code with the loaded worker rather than recompiling.
 static Worker::Script::ModuleContent extractWasmModuleContent(
     jsg::Lock& js, jsg::V8Ref<v8::WasmModuleObject>& wasmModule) {
   auto compiled = wasmModule.getHandle(js)->GetCompiledModule();
   auto wireBytes = compiled.GetWireBytesRef();
   return Worker::Script::WasmModule{
-    .body = kj::arrayPtr(wireBytes.data(), wireBytes.size()),
+    .body = kj::arc<kj::Array<const byte>>(
+        kj::heapArray<const byte>(kj::arrayPtr(wireBytes.data(), wireBytes.size()))),
     .compiledModule = kj::mv(compiled),
   };
 }
@@ -256,15 +241,16 @@ Worker::Script::Source WorkerLoader::extractSource(jsg::Lock& js, WorkerCode& co
       KJ_CASE_ONEOF(text, kj::String) {
         if (entry.name.endsWith(".py"_kj)) {
           return {
-            .name = entry.name,
-            .content = Worker::Script::PythonModule{.body = text},
+            .name = kj::arc<kj::String>(kj::str(entry.name)),
+            .content = Worker::Script::PythonModule{.body = kj::arc<kj::String>(kj::mv(text))},
           };
         }
 
         if (entry.name.endsWith(".js"_kj)) {
           return {
-            .name = entry.name,
-            .content = Worker::Script::EsModule{.body = text},
+            .name = kj::arc<kj::String>(kj::str(entry.name)),
+            .content = Worker::Script::EsModule{.body = kj::arc<kj::Array<const char>>(
+                                                    kj::heapArray<const char>(text.asArray()))},
           };
         }
 
@@ -272,8 +258,8 @@ Worker::Script::Source WorkerLoader::extractSource(jsg::Lock& js, WorkerCode& co
         // so we don't limit file extensions for Python workers.
         if (code.mainModule.endsWith(".py"_kj) && entry.name.startsWith("python_modules/"_kj)) {
           return {
-            .name = entry.name,
-            .content = Worker::Script::TextModule{.body = text},
+            .name = kj::arc<kj::String>(kj::str(entry.name)),
+            .content = Worker::Script::TextModule{.body = kj::arc<kj::String>(kj::mv(text))},
           };
         }
 
@@ -293,7 +279,7 @@ Worker::Script::Source WorkerLoader::extractSource(jsg::Lock& js, WorkerCode& co
       KJ_CASE_ONEOF(wasmModule, jsg::V8Ref<v8::WasmModuleObject>) {
         // An already-compiled `WebAssembly.Module` (e.g. from a source phase import).
         return {
-          .name = entry.name,
+          .name = kj::arc<kj::String>(kj::str(entry.name)),
           .content = extractWasmModuleContent(js, wasmModule),
         };
       }
@@ -306,14 +292,16 @@ Worker::Script::Source WorkerLoader::extractSource(jsg::Lock& js, WorkerCode& co
             "Module '",
             entry.name, "' contained ", fieldCount, " properties.");
 
-        return {.name = entry.name, .content = [&]() -> Worker::Script::ModuleContent {
+        return {.name = kj::arc<kj::String>(kj::str(entry.name)),
+          .content = [&]() -> Worker::Script::ModuleContent {
           KJ_IF_SOME(js, module.js) {
             // TODO: this might need typescript transpilation too.
-            return Worker::Script::EsModule{.body = js};
+            return Worker::Script::EsModule{
+              .body = kj::arc<kj::Array<const char>>(kj::heapArray<const char>(js.asArray()))};
           } else KJ_IF_SOME(cjs, module.cjs) {
-            return Worker::Script::CommonJsModule{.body = cjs};
+            return Worker::Script::CommonJsModule{.body = kj::arc<kj::String>(kj::mv(cjs))};
           } else KJ_IF_SOME(text, module.text) {
-            return Worker::Script::TextModule{.body = text};
+            return Worker::Script::TextModule{.body = kj::arc<kj::String>(kj::mv(text))};
           } else KJ_IF_SOME(data, module.data) {
             // The kj::Array<const byte> produced by jsg::asBytes() points into a V8
             // BackingStore. If the user passed a *resizable* ArrayBuffer they can call
@@ -321,22 +309,22 @@ Worker::Script::Source WorkerLoader::extractSource(jsg::Lock& js, WorkerCode& co
             // isolate is compiled asynchronously, leaving us with a (ptr,len) into
             // PROT_NONE pages. Copy now so the bytes survive until compileDataGlobal().
             data = kj::heapArray<const kj::byte>(data.asPtr());
-            return Worker::Script::DataModule{.body = data};
+            return Worker::Script::DataModule{.body = kj::arc<kj::Array<const byte>>(kj::mv(data))};
           } else KJ_IF_SOME(json, module.json) {
-            kj::StringPtr serialized =
-                module.serializedJson.emplace(js.serializeJson(kj::mv(json)));
+            auto serialized = js.serializeJson(kj::mv(json));
             // We moved out of `json`, making it an empty V8Ref, explicitly
             // clear out the field as we don't intend to re-use this
             module.json = kj::none;
-            return Worker::Script::JsonModule{.body = serialized};
+            return Worker::Script::JsonModule{.body = kj::arc<kj::String>(kj::mv(serialized))};
           } else KJ_IF_SOME(py, module.py) {
-            return Worker::Script::PythonModule{.body = py};
+            return Worker::Script::PythonModule{.body = kj::arc<kj::String>(kj::mv(py))};
           } else KJ_IF_SOME(wasm, module.wasm) {
             KJ_SWITCH_ONEOF(wasm) {
               KJ_CASE_ONEOF(bytes, kj::Array<const byte>) {
                 // Same as `data` above: copy out of the V8 BackingStore before going async.
                 bytes = kj::heapArray<const kj::byte>(bytes.asPtr());
-                return Worker::Script::WasmModule{.body = bytes};
+                return Worker::Script::WasmModule{
+                  .body = kj::arc<kj::Array<const byte>>(kj::mv(bytes))};
               }
               KJ_CASE_ONEOF(wasmModule, jsg::V8Ref<v8::WasmModuleObject>) {
                 // No copy needed here: the wire bytes are owned by the compiled module itself,
@@ -363,31 +351,31 @@ Worker::Script::Source WorkerLoader::extractSource(jsg::Lock& js, WorkerCode& co
   for (auto& module: modules) {
     auto isPythonModule = module.content.is<Worker::Script::PythonModule>();
     if (!isPython && isPythonModule) {
-      JSG_FAIL_REQUIRE(TypeError, "Module \"", module.name,
+      JSG_FAIL_REQUIRE(TypeError, "Module \"", *module.name,
           "\" is a Python module, but the main module isn't a Python module.");
     }
 
     KJ_SWITCH_ONEOF(module.content) {
       KJ_CASE_ONEOF(m, Worker::Script::EsModule) {
-        totalCodeSize += m.body.size();
+        totalCodeSize += m.body->size();
       }
       KJ_CASE_ONEOF(m, Worker::Script::CommonJsModule) {
-        totalCodeSize += m.body.size();
+        totalCodeSize += m.body->size();
       }
       KJ_CASE_ONEOF(m, Worker::Script::TextModule) {
-        totalCodeSize += m.body.size();
+        totalCodeSize += m.body->size();
       }
       KJ_CASE_ONEOF(m, Worker::Script::DataModule) {
-        totalCodeSize += m.body.size();
+        totalCodeSize += m.body->size();
       }
       KJ_CASE_ONEOF(m, Worker::Script::WasmModule) {
-        totalCodeSize += m.body.size();
+        totalCodeSize += m.body->size();
       }
       KJ_CASE_ONEOF(m, Worker::Script::JsonModule) {
-        totalCodeSize += m.body.size();
+        totalCodeSize += m.body->size();
       }
       KJ_CASE_ONEOF(m, Worker::Script::PythonModule) {
-        totalCodeSize += m.body.size();
+        totalCodeSize += m.body->size();
       }
       KJ_CASE_ONEOF(m, Worker::Script::ObsoletePythonRequirement) {}
       KJ_CASE_ONEOF(m, Worker::Script::CapnpModule) {}
@@ -399,13 +387,13 @@ Worker::Script::Source WorkerLoader::extractSource(jsg::Lock& js, WorkerCode& co
       " bytes.");
 
   return Worker::Script::ModulesSource{
-    .mainModule = code.mainModule,
-    .modules = kj::mv(modules),
+    .mainModule = kj::arc<kj::String>(kj::str(code.mainModule)),
+    .modules = kj::arc<kj::Array<Worker::Script::Module>>(kj::mv(modules)),
     .isPython = isPython,
   };
 }
 
-kj::Own<CompatibilityFlags::Reader> WorkerLoader::extractCompatFlags(
+kj::Arc<CompatibilityFlags::Reader> WorkerLoader::extractCompatFlags(
     jsg::Lock& js, WorkerCode& code, CompatibilityDateValidation compatDateValidation) {
   bool allowExperimental = code.allowExperimental.orDefault(false);
   if (!FeatureFlags::get(js).getWorkerdExperimental()) {
@@ -419,22 +407,20 @@ kj::Own<CompatibilityFlags::Reader> WorkerLoader::extractCompatFlags(
     compatFlags = f;
   }
 
-  capnp::word scratch[capnp::sizeInWords<CompatibilityFlags>() + 4]{};
-  capnp::MallocMessageBuilder compatFlagsMessage(scratch);
-  auto compatFlagsBuilder = compatFlagsMessage.getRoot<CompatibilityFlags>();
-
   SimpleWorkerErrorReporter errorReporter;
 
-  // allowedExperimentalFlags is nullptr on purpose, a worker loader being trusted with specific
-  // experimental flags should not imply that it can delegate that trust to its dynamic workers.
-  compileCompatibilityFlags(code.compatibilityDate, compatFlags, compatFlagsBuilder, errorReporter,
-      allowExperimental, compatDateValidation, nullptr);
+  auto result = buildArcMessage<CompatibilityFlags>([&](CompatibilityFlags::Builder builder) {
+    // allowedExperimentalFlags is nullptr on purpose, a worker loader being trusted with specific
+    // experimental flags should not imply that it can delegate that trust to its dynamic workers.
+    compileCompatibilityFlags(code.compatibilityDate, compatFlags, builder, errorReporter,
+        allowExperimental, compatDateValidation, nullptr);
+  });
 
   if (!errorReporter.errors.empty()) {
     JSG_FAIL_REQUIRE(Error, errorReporter.errors.front());
   }
 
-  return capnp::clone(compatFlagsBuilder.asReader());
+  return result;
 }
 
 }  // namespace workerd::api

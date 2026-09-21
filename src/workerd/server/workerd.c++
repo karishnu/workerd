@@ -16,6 +16,7 @@
 #include <workerd/server/workerd-capnp-schema.embed.h>
 #include <workerd/server/workerd.capnp.h>
 #include <workerd/util/autogate.h>
+#include <workerd/util/capnp-util.h>
 #include <workerd/util/entropy.h>
 
 #include <errno.h>
@@ -506,9 +507,12 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
         KJ_ASSERT(reinterpret_cast<uintptr_t>(mapping.begin()) % sizeof(capnp::word) == 0,
             "compiled-in config is not aligned correctly?");
 
-        config = capnp::readMessageUnchecked<config::Config>(
+        auto configReader = capnp::readMessageUnchecked<config::Config>(
             reinterpret_cast<const capnp::word*>(mapping.begin()));
-        configOwner = kj::heap(kj::mv(mapping));
+        config = configReader;
+        auto ownedMapping = kj::arc<decltype(mapping)>(kj::mv(mapping));
+        ownedConfig =
+            kj::mv(ownedMapping).project([configReader](const auto&) { return configReader; });
       }
     } else {
       context.warning(
@@ -518,7 +522,8 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
 
     // We don't want to force people to specify top-level file IDs in `workerd` config files, as
     // those IDs would be totally irrelevant.
-    schemaParser.setFileIdsRequired(false);
+    // The Arc is still exclusive, so it is safe to configure the parser before it is shared.
+    const_cast<capnp::SchemaParser&>(*schemaParser).setFileIdsRequired(false);
   }
 
   kj::MainFunc getMain() {
@@ -925,21 +930,20 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
   }
 
   void parsePythonCompatFlag(kj::StringPtr compatFlagStr) {
-    auto builder = kj::heap<capnp::MallocMessageBuilder>();
-    auto configBuilder = builder->initRoot<config::Config>();
-    auto service = configBuilder.initServices(1)[0];
-    service.setName("main");
-    auto worker = service.initWorker();
-    worker.setCompatibilityDate("2023-12-18");
-    auto flags = worker.initCompatibilityFlags(2);
-    flags.set(0, compatFlagStr);
-    flags.set(1, "python_workers");
-    auto mod = worker.initModules(1)[0];
-    mod.setName("main.py");
-    mod.setPythonModule("def test():\n pass");
-    config = configBuilder.asReader();
-    configOwner = kj::mv(builder);
-    util::Autogate::initAutogate(getConfig().getAutogates());
+    ownedConfig = buildArcMessage<config::Config>([&](config::Config::Builder config) {
+      auto service = config.initServices(1)[0];
+      service.setName("main");
+      auto worker = service.initWorker();
+      worker.setCompatibilityDate("2023-12-18");
+      auto flags = worker.initCompatibilityFlags(2);
+      flags.set(0, compatFlagStr);
+      flags.set(1, "python_workers");
+      auto mod = worker.initModules(1)[0];
+      mod.setName("main.py");
+      mod.setPythonModule("def test():\n pass");
+    });
+    config = *KJ_ASSERT_NONNULL(ownedConfig);
+    util::Autogate::initAutogate(getConfig()->getAutogates());
   }
 
   void watch() {
@@ -968,11 +972,17 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
       auto handle = GetStdHandle(STD_INPUT_HANDLE);
       auto stream = kj::HandleInputStream(handle);
       auto reader = kj::heap<capnp::InputStreamMessageReader>(stream, CONFIG_READER_OPTIONS);
+      auto configReader = reader->getRoot<config::Config>();
+      auto ownedReader = kj::Arc<capnp::InputStreamMessageReader>(kj::mv(reader));
 #else
-      auto reader = kj::heap<capnp::StreamFdMessageReader>(STDIN_FILENO, CONFIG_READER_OPTIONS);
+      auto ownedReader = kj::arc<capnp::StreamFdMessageReader>(STDIN_FILENO, CONFIG_READER_OPTIONS);
+      // The Arc is still exclusive, so lazy reads can initialize the reader before it is shared.
+      auto& mutableReader = const_cast<capnp::StreamFdMessageReader&>(*ownedReader);
+      auto configReader = mutableReader.getRoot<config::Config>();
 #endif
-      config = reader->getRoot<config::Config>();
-      configOwner = kj::mv(reader);
+      config = configReader;
+      ownedConfig =
+          kj::mv(ownedReader).project([configReader](const auto&) { return configReader; });
     } else {
       // Read file from disk.
       auto path = fs->getCurrentPath().evalNative(pathStr);
@@ -991,13 +1001,20 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
             mapping.size() / sizeof(capnp::word));
         auto reader = kj::heap<capnp::FlatArrayMessageReader>(words, CONFIG_READER_OPTIONS)
                           .attach(kj::mv(mapping));
-        config = reader->getRoot<config::Config>();
-        configOwner = kj::mv(reader);
+        auto configReader = reader->getRoot<config::Config>();
+        config = configReader;
+        auto ownedReader = kj::Arc<capnp::FlatArrayMessageReader>(kj::mv(reader));
+        ownedConfig =
+            kj::mv(ownedReader).project([configReader](const capnp::FlatArrayMessageReader&) {
+          return configReader;
+        });
       } else {
         // Interpret as schema file.
-        schemaParser.loadCompiledTypeAndDependencies<config::Config>();
+        // The Arc is still exclusive, so it is safe to use the mutable parser while loading.
+        auto& mutableSchemaParser = const_cast<capnp::SchemaParser&>(*schemaParser);
+        mutableSchemaParser.loadCompiledTypeAndDependencies<config::Config>();
 
-        parsedSchema = schemaParser.parseFile(kj::heap<SchemaFileImpl>(fs->getRoot(),
+        parsedSchema = mutableSchemaParser.parseFile(kj::heap<SchemaFileImpl>(fs->getRoot(),
             fs->getCurrentPath(), kj::mv(path), nullptr, importPath, kj::mv(file),
             watcher.map([](kj::Own<FileWatcher>& w) -> FileWatcher& { return *w; }), *this));
 
@@ -1019,7 +1036,7 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
     // We'll fail at getConfig() if there are multiple top level Config objects.
     // The error message says that you have to specify which config to use, but
     // it's not clear that there is any mechanism to do that.
-    util::Autogate::initAutogate(getConfig().getAutogates());
+    util::Autogate::initAutogate(getConfig()->getAutogates());
   }
 
   void setConstName(kj::StringPtr name) {
@@ -1048,6 +1065,7 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
     }
 
     config = constSchema.as<config::Config>();
+    ownedConfig = kj::none;
   }
 
   void setTestFilter(kj::StringPtr filter) {
@@ -1094,7 +1112,8 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
       context.exit();
     }
 
-    config::Config::Reader config = getConfig();
+    auto ownedConfig = getConfig();
+    auto config = *ownedConfig;
 
 #if _WIN32
     if (_isatty(_fileno(stdout))) {
@@ -1207,7 +1226,8 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
       }
 #endif
       TRACE_EVENT("workerd", "serveImpl()");
-      auto config = getConfig();
+      auto ownedConfig = getConfig();
+      auto config = *ownedConfig;
 
       // Configure structured logging in the process context
       if (config.hasLogging() ? config.getLogging().getStructuredLogging()
@@ -1219,7 +1239,7 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
       WorkerdPlatform v8Platform(*platform);
       jsg::V8System v8System(v8Platform,
           KJ_MAP(flag, config.getV8Flags()) -> kj::StringPtr { return flag; }, platform.get());
-      auto promise = func(v8System, config);
+      auto promise = func(v8System, kj::mv(ownedConfig));
       KJ_IF_SOME(w, watcher) {
         promise = promise.exclusiveJoin(waitForChanges(*w).then([this]() {
           // Watch succeeded.
@@ -1244,11 +1264,11 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
   }
 
   void serve() noexcept {
-    serveImpl([&](jsg::V8System& v8System, config::Config::Reader config) {
+    serveImpl([&](jsg::V8System& v8System, kj::Arc<config::Config::Reader> config) {
 #if _WIN32
-      return server->run(v8System, config);
+      return server->run(v8System, kj::mv(config));
 #else
-      return server->run(v8System, config,
+      return server->run(v8System, kj::mv(config),
           // Gracefully drain when SIGTERM is received (backend-specific; see cli-io-backend.h).
           onSigterm(io));
 #endif
@@ -1278,9 +1298,9 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
     // Enable loopback sockets in tests only.
     network.enableLoopback();
 
-    serveImpl([&](jsg::V8System& v8System, config::Config::Reader config) {
+    serveImpl([&](jsg::V8System& v8System, kj::Arc<config::Config::Reader> config) {
       return server
-          ->test(v8System, config,
+          ->test(v8System, kj::mv(config),
               testServicePattern.map([](auto& s) -> kj::StringPtr { return s; }).orDefault("*"_kj),
               testEntrypointPattern.map([](auto& s) -> kj::StringPtr {
         return s;
@@ -1353,12 +1373,12 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
   EntropySourceImpl entropySource;
 
   kj::Vector<kj::Path> importPath;
-  capnp::SchemaParser schemaParser;
+  kj::Arc<capnp::SchemaParser> schemaParser = kj::arc<capnp::SchemaParser>();
   capnp::ParsedSchema parsedSchema;
   kj::Vector<capnp::ConstSchema> topLevelConfigConstants;
 
-  kj::Own<void> configOwner;  // backing object for `config`, if it's not `schemaParser`.
   kj::Maybe<config::Config::Reader> config;
+  kj::Maybe<kj::Arc<config::Config::Reader>> ownedConfig;
 
   kj::Vector<int> inheritedFds;
 
@@ -1448,9 +1468,14 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
     return kj::none;
   }
 
-  config::Config::Reader getConfig() {
+  kj::Arc<config::Config::Reader> getConfig() {
+    KJ_IF_SOME(c, ownedConfig) {
+      return c.addRef();
+    }
+
+    config::Config::Reader reader;
     KJ_IF_SOME(c, config) {
-      return c;
+      reader = c;
     } else {
       // The optional `<const-name>` parameter must not have been given -- otherwise we would have
       // a non-null `config` by this point. See if we can infer the correct constant...
@@ -1458,7 +1483,7 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
         context.exitError(
             "The config file does not define any top-level constants of type 'Config'.");
       } else if (topLevelConfigConstants.size() == 1) {
-        return config.emplace(topLevelConfigConstants[0].as<config::Config>());
+        reader = config.emplace(topLevelConfigConstants[0].as<config::Config>());
       } else {
         auto names = KJ_MAP(cnst, topLevelConfigConstants) { return cnst.getShortDisplayName(); };
         // TODO: this error message says "you must specify which one to use".
@@ -1471,6 +1496,11 @@ class CliMain final: public SchemaFileImpl::ErrorReporter {
             kj::strArray(names, ", ")));
       }
     }
+
+    auto result =
+        schemaParser.addRef().project([reader](const capnp::SchemaParser&) { return reader; });
+    ownedConfig = result.addRef();
+    return result;
   }
 
   kj::Maybe<ExeInfo> exeInfo = getExecFile(context, *fs);

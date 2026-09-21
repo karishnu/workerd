@@ -7,85 +7,61 @@ kj::Rc<Directory> getBundleDirectory(const WorkerSource& conf) {
   // to avoid unnecessary operations in the case a worker never actually uses
   // this part of the filesystem.
 
-  // Importantly, the WorkerSource we get here won't be sticking around.
-  // We need to copy the details we need out of it now...Critically, however,
-  // the caller needs to arrange to keep the original source alive for the
-  // lifetime of the directory since the directory only contains pointers.
   struct Entry {
-    kj::StringPtr name;
-    kj::ArrayPtr<const kj::byte> data;
-    // When the module body is owned by the (transient) WorkerSource -- as is the case for
-    // TypeScript transpiled at load time, where the body lives in EsModule::ownBody -- we must copy
-    // it here, because the WorkerSource (and thus ownBody) is destroyed once worker setup completes.
-    // At materialization this owned copy is handed to the File itself (File::newReadable(kj::Array)),
-    // so the bytes outlive both the source and the lazy closure -- note the closure that holds these
-    // entries is itself destroyed after the directory is first materialized (see
-    // LazyDirectory::getDirectory), so a non-owning File would still dangle. When kj::none, `data`
-    // points into memory the caller guarantees outlives the directory (process-lifetime capnp
-    // buffers or a retained source clone). See VULN-136997 and the matching copy in
-    // worker-modules.h.
-    kj::Maybe<kj::Array<const kj::byte>> ownedData;
+    kj::Arc<kj::String> name;
+    kj::OneOf<kj::Arc<kj::String>,
+        kj::Arc<kj::Array<const char>>,
+        kj::Arc<kj::Array<const kj::byte>>>
+        data;
   };
   kj::Vector<Entry> entries;
   KJ_SWITCH_ONEOF(conf.variant) {
     KJ_CASE_ONEOF(script, WorkerSource::ScriptSource) {
       entries.add(Entry{
-        .name = script.mainScriptName,
-        .data = script.mainScript.asBytes(),
+        .name = script.mainScriptName.addRef(),
+        .data = script.mainScript.addRef(),
       });
     }
     KJ_CASE_ONEOF(modules, WorkerSource::ModulesSource) {
-      for (auto& module: modules.modules) {
+      for (auto& module: *modules.modules) {
         KJ_SWITCH_ONEOF(module.content) {
           KJ_CASE_ONEOF(esModule, WorkerSource::EsModule) {
-            Entry entry{
-              .name = module.name,
-              .data = esModule.body.asBytes(),
-            };
-            // If the body was transpiled at load time it is owned by the transient WorkerSource;
-            // copy it so the lazy directory does not read freed memory after the source is
-            // destroyed (VULN-136997).
-            if (esModule.ownBody != kj::none) {
-              auto owned = kj::heapArray<const kj::byte>(esModule.body.asBytes());
-              entry.data = owned.asPtr();
-              entry.ownedData = kj::mv(owned);
-            }
-            entries.add(kj::mv(entry));
+            entries.add(Entry{.name = module.name.addRef(), .data = esModule.body.addRef()});
           }
           KJ_CASE_ONEOF(commonJsModule, WorkerSource::CommonJsModule) {
             entries.add(Entry{
-              .name = module.name,
-              .data = commonJsModule.body.asBytes(),
+              .name = module.name.addRef(),
+              .data = commonJsModule.body.addRef(),
             });
           }
           KJ_CASE_ONEOF(textModule, WorkerSource::TextModule) {
             entries.add(Entry{
-              .name = module.name,
-              .data = textModule.body.asBytes(),
+              .name = module.name.addRef(),
+              .data = textModule.body.addRef(),
             });
           }
           KJ_CASE_ONEOF(dataModule, WorkerSource::DataModule) {
             entries.add(Entry{
-              .name = module.name,
-              .data = dataModule.body,
+              .name = module.name.addRef(),
+              .data = dataModule.body.addRef(),
             });
           }
           KJ_CASE_ONEOF(wasmModule, WorkerSource::WasmModule) {
             entries.add(Entry{
-              .name = module.name,
-              .data = wasmModule.body,
+              .name = module.name.addRef(),
+              .data = wasmModule.body.addRef(),
             });
           }
           KJ_CASE_ONEOF(jsonModule, WorkerSource::JsonModule) {
             entries.add(Entry{
-              .name = module.name,
-              .data = jsonModule.body.asBytes(),
+              .name = module.name.addRef(),
+              .data = jsonModule.body.addRef(),
             });
           }
           KJ_CASE_ONEOF(pythonModule, WorkerSource::PythonModule) {
             entries.add(Entry{
-              .name = module.name,
-              .data = pythonModule.body.asBytes(),
+              .name = module.name.addRef(),
+              .data = pythonModule.body.addRef(),
             });
           }
           KJ_CASE_ONEOF(pythonRequirement, WorkerSource::ObsoletePythonRequirement) {
@@ -100,9 +76,6 @@ kj::Rc<Directory> getBundleDirectory(const WorkerSource& conf) {
     }
   }
 
-  // `mutable` so we can move the owned module bytes out of the captured entries into their Files
-  // below. This is safe because the closure is invoked at most once: getLazyDirectoryImpl memoizes
-  // the produced Directory and discards the closure after the first call.
   return getLazyDirectoryImpl([entries = entries.releaseAsArray()]() mutable {
     Directory::Builder builder;
     kj::Path kRoot{};
@@ -111,7 +84,7 @@ kj::Rc<Directory> getBundleDirectory(const WorkerSource& conf) {
     // pathologically deep names can never be addressed by node:fs anyway.
     static constexpr size_t kMaxBundlePathDepth = 1024;
     for (auto& entry: entries) {
-      auto url = KJ_ASSERT_NONNULL(jsg::Url::tryParse(entry.name, "file:///"_kj));
+      auto url = KJ_ASSERT_NONNULL(jsg::Url::tryParse(*entry.name, "file:///"_kj));
       // If the name is not a valid file URL path, ignore it.
       if (url.getProtocol() != "file:"_kj) {
         continue;
@@ -122,12 +95,16 @@ kj::Rc<Directory> getBundleDirectory(const WorkerSource& conf) {
         KJ_LOG(WARNING, "Skipping overly deep module path", path.size());
         continue;
       }
-      KJ_IF_SOME(owned, entry.ownedData) {
-        // The bytes are owned by the transient WorkerSource; transfer ownership to the File so
-        // they survive both the source's destruction and this closure's (VULN-136997).
-        builder.addPath(path, File::newReadable(kj::mv(owned)));
-      } else {
-        builder.addPath(path, File::newReadable(entry.data));
+      KJ_SWITCH_ONEOF(entry.data) {
+        KJ_CASE_ONEOF(data, kj::Arc<kj::String>) {
+          builder.addPath(path, File::newReadable(kj::mv(data)));
+        }
+        KJ_CASE_ONEOF(data, kj::Arc<kj::Array<const char>>) {
+          builder.addPath(path, File::newReadable(kj::mv(data)));
+        }
+        KJ_CASE_ONEOF(data, kj::Arc<kj::Array<const kj::byte>>) {
+          builder.addPath(path, File::newReadable(kj::mv(data)));
+        }
       }
     }
     return builder.finish();

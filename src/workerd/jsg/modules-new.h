@@ -424,12 +424,18 @@ class Module {
   // common.
 
   static EvaluateCallback newTextModuleHandler(kj::ArrayPtr<const char> data) KJ_WARN_UNUSED_RESULT;
+  static EvaluateCallback newOwnedTextModuleHandler(kj::Arc<kj::String> data) KJ_WARN_UNUSED_RESULT;
   static EvaluateCallback newDataModuleHandler(
       kj::ArrayPtr<const kj::byte> data) KJ_WARN_UNUSED_RESULT;
+  static EvaluateCallback newOwnedDataModuleHandler(
+      kj::Arc<kj::Array<const kj::byte>> data) KJ_WARN_UNUSED_RESULT;
   static EvaluateCallback newJsonModuleHandler(kj::ArrayPtr<const char> data) KJ_WARN_UNUSED_RESULT;
+  static EvaluateCallback newOwnedJsonModuleHandler(kj::Arc<kj::String> data) KJ_WARN_UNUSED_RESULT;
   // If `maybeCompiled` is given, it seeds the compilation cache so the module is never
   // recompiled from `data`.
   static EvaluateCallback newWasmModuleHandler(kj::ArrayPtr<const kj::byte> data,
+      kj::Maybe<v8::CompiledWasmModule> maybeCompiled = kj::none) KJ_WARN_UNUSED_RESULT;
+  static EvaluateCallback newOwnedWasmModuleHandler(kj::Arc<kj::Array<const kj::byte>> data,
       kj::Maybe<v8::CompiledWasmModule> maybeCompiled = kj::none) KJ_WARN_UNUSED_RESULT;
 
   // An eval function is used for CommonJS style modules (including Node.js compat
@@ -448,7 +454,18 @@ class Module {
   // type T are exposed as additional globals within the executed scope.
   template <typename T, typename TypeWrapper>
   static EvaluateCallback newCjsStyleModuleHandler(kj::StringPtr source) KJ_WARN_UNUSED_RESULT {
-    return [source](Lock& js, const Url& id, const Module::ModuleNamespace& ns,
+    return newCjsStyleModuleHandlerImpl<T, TypeWrapper>(source);
+  }
+
+  template <typename T, typename TypeWrapper>
+  static EvaluateCallback newOwnedCjsStyleModuleHandler(
+      kj::Arc<kj::String> source) KJ_WARN_UNUSED_RESULT {
+    return newCjsStyleModuleHandlerImpl<T, TypeWrapper>(kj::mv(source));
+  }
+
+  template <typename T, typename TypeWrapper, typename Source>
+  static EvaluateCallback newCjsStyleModuleHandlerImpl(Source source) KJ_WARN_UNUSED_RESULT {
+    return [source = kj::mv(source)](Lock& js, const Url& id, const Module::ModuleNamespace& ns,
                const CompilationObserver& observer) mutable -> bool {
       return js.tryCatch([&] {
         auto& wrapper = TypeWrapper::from(js.v8Isolate);
@@ -462,7 +479,7 @@ class Module {
         // This also keeps CJS stack-trace filenames consistent with ESM modules,
         // whose origins are always their canonical URLs.
         auto href = kj::str(id.getHref());
-        auto fn = Module::compileEvalFunction(js, source, href,
+        auto fn = Module::compileEvalFunction(js, asStringPtr(source), href,
             JsObject(wrapper.wrap(js, js.v8Context(), kj::none, ext.addRef())), observer);
         fn(js);
         // If there are named exports specified for the module namespace,
@@ -479,6 +496,13 @@ class Module {
         return false;
       });
     };
+  }
+
+  static kj::StringPtr asStringPtr(kj::StringPtr source) {
+    return source;
+  }
+  static kj::StringPtr asStringPtr(const kj::Arc<kj::String>& source) {
+    return *source;
   }
 
   // A ModuleHandler used to create a synthetic module that is backed by a jsg::Object.
@@ -583,6 +607,9 @@ class ModuleBundle {
 
     BundleBuilder& addWasmModule(kj::StringPtr name,
         kj::ArrayPtr<const kj::byte> data,
+        kj::Maybe<v8::CompiledWasmModule> maybeCompiled = kj::none) KJ_LIFETIMEBOUND;
+    BundleBuilder& addOwnedWasmModule(kj::StringPtr name,
+        kj::Arc<kj::Array<const kj::byte>> data,
         kj::Maybe<v8::CompiledWasmModule> maybeCompiled = kj::none) KJ_LIFETIMEBOUND;
 
     BundleBuilder& alias(kj::StringPtr alias, kj::StringPtr name) KJ_LIFETIMEBOUND;
