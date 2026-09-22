@@ -1,0 +1,37 @@
+types/defines/flagship.d.ts
+  s_02b51dddc986ff::t_8f14a3d9279a47 5-12,15
+types/generated-snapshot/experimental/index.d.ts
+  s_a15939d52a755c::t_360acc35dafc76 15056-15065
+types/generated-snapshot/experimental/index.ts
+  s_a15939d52a755c::t_6557ce9b54861c 15073-15081,15084
+types/generated-snapshot/index.d.ts
+  s_a15939d52a755c::t_49caea286d893f 14773-14782
+types/generated-snapshot/index.ts
+  s_a15939d52a755c::t_50b19e7f579637 14790-14798,14801
+types/test/types/flagship-context.ts
+  s_02b51dddc986ff::t_0c119e89ff17a1 1-25
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0b13bab2a72dea7b6544fef017a8584391343112",
+  "prompts": {},
+  "sessions": {
+    "s_02b51dddc986ff": {
+      "agent_id": {
+        "tool": "windsurf",
+        "id": "yielding-fifth",
+        "model": "unknown"
+      },
+      "human_author": "Karishnu Poddar <karishnu@cloudflare.com>"
+    },
+    "s_a15939d52a755c": {
+      "agent_id": {
+        "tool": "windsurf",
+        "id": "complete-effect",
+        "model": "unknown"
+      },
+      "human_author": "Karishnu Poddar <karishnu@cloudflare.com>"
+    }
+  }
+}
