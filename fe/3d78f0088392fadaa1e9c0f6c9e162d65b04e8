@@ -1,0 +1,25 @@
+types/generated-snapshot/experimental/index.d.ts
+  s_a15939d52a755c::t_b712c3c96e9285 15091,15098-15123
+types/generated-snapshot/experimental/index.ts
+  s_a15939d52a755c::t_371f0230073376 15111,15118-15143
+types/generated-snapshot/index.d.ts
+  s_a15939d52a755c::t_8abf698cddd2b4 14808,14815-14840
+types/generated-snapshot/index.ts
+  s_a15939d52a755c::t_befe21286cad6c 14828,14835-14860
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "fe3d78f0088392fadaa1e9c0f6c9e162d65b04e8",
+  "prompts": {},
+  "sessions": {
+    "s_a15939d52a755c": {
+      "agent_id": {
+        "tool": "windsurf",
+        "id": "complete-effect",
+        "model": "unknown"
+      },
+      "human_author": "Karishnu Poddar <karishnu@cloudflare.com>"
+    }
+  }
+}
