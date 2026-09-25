@@ -1,0 +1,25 @@
+types/generated-snapshot/experimental/index.d.ts
+  s_a2035ad6fcbd85::t_db20617f2dd047 15065-15071,15117,15130
+types/generated-snapshot/experimental/index.ts
+  s_a2035ad6fcbd85::t_ab46b4b396975d 15085-15091,15137,15150
+types/generated-snapshot/index.d.ts
+  s_a2035ad6fcbd85::t_ff3539accc9a92 14782-14788,14834,14847
+types/generated-snapshot/index.ts
+  s_a2035ad6fcbd85::t_0d0efd05115a28 14802-14808,14854,14867
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "10b85fdbae9a3810ffe8f5d5a74e9a49d0f87c38",
+  "prompts": {},
+  "sessions": {
+    "s_a2035ad6fcbd85": {
+      "agent_id": {
+        "tool": "windsurf",
+        "id": "vivid-streetcar",
+        "model": "unknown"
+      },
+      "human_author": "Karishnu Poddar <karishnu@cloudflare.com>"
+    }
+  }
+}
